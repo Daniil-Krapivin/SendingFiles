@@ -1,8 +1,7 @@
 """
-title: Example Filter
-author: open-webui
+title: Qwen Vision Preprocessor
+author: user
 author_url: https://github.com/open-webui
-funding_url: https://github.com/open-webui
 version: 0.1
 """
 
@@ -16,53 +15,87 @@ class Filter:
         priority: int = Field(
             default=0, description="Priority level for the filter operations."
         )
-        max_turns: int = Field(
-            default=8, description="Maximum allowable conversation turns for a user."
+        vision_api_url: str = Field(
+            default="http://vllm-qwen:8000/v1",
+            description="Qwen vLLM server URL"
+        )
+        vision_model: str = Field(
+            default="Qwen/Qwen2.5-VL-3B-Instruct",
+            description="Vision model name"
+        )
+        extraction_prompt: str = Field(
+            default="Extract all text from this image verbatim. If no text, briefly describe what you see.",
+            description="Prompt sent to vision model"
         )
         pass
 
     class UserValves(BaseModel):
-        max_turns: int = Field(
-            default=4, description="Maximum allowable conversation turns for a user."
-        )
         pass
 
     def __init__(self):
-        # Indicates custom file handling logic. This flag helps disengage default routines in favor of custom
-        # implementations, informing the WebUI to defer file-related operations to designated methods within this class.
-        # Alternatively, you can remove the files directly from the body in from the inlet hook
-        # self.file_handler = True
-
-        # Initialize 'valves' with specific configurations. Using 'Valves' instance helps encapsulate settings,
-        # which ensures settings are managed cohesively and not confused with operational flags like 'file_handler'.
         self.valves = self.Valves()
         pass
 
+    def _process_image(self, image_data: str) -> str:
+        """Send image to Qwen and get text extraction."""
+        if not image_data.startswith("data:"):
+            image_data = f"data:image/png;base64,{image_data}"
+
+        try:
+            response = requests.post(
+                f"{self.valves.vision_api_url}/chat/completions",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": self.valves.vision_model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": self.valves.extraction_prompt},
+                            {"type": "image_url", "image_url": {"url": image_data}}
+                        ]
+                    }],
+                    "max_tokens": 1024
+                },
+                timeout=60
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"[Image processing error: {str(e)}]"
+
     def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        # Modify the request body or validate it before processing by the chat completion API.
-        # This function is the pre-processor for the API where various checks on the input can be performed.
-        # It can also modify the request before sending it to the API.
         print(f"inlet:{__name__}")
-        print(f"inlet:body:{body}")
-        print(f"inlet:user:{__user__}")
 
-        if __user__.get("role", "admin") in ["user", "admin"]:
-            messages = body.get("messages", [])
+        messages = body.get("messages", [])
 
-            max_turns = min(__user__["valves"].max_turns, self.valves.max_turns)
-            if len(messages) > max_turns:
-                raise Exception(
-                    f"Conversation turn limit exceeded. Max turns: {max_turns}"
-                )
+        for msg in messages:
+            content = msg.get("content")
+
+            # Handle OpenAI vision format (list with text and image_url)
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item["text"])
+                    elif item.get("type") == "image_url":
+                        image_url = item["image_url"].get("url", "")
+                        extracted = self._process_image(image_url)
+                        text_parts.append(f"[Image content: {extracted}]")
+
+                msg["content"] = "\n\n".join(text_parts)
+
+            # Handle Ollama format (images array)
+            if "images" in msg:
+                extracted_texts = []
+                for img in msg["images"]:
+                    extracted = self._process_image(img)
+                    extracted_texts.append(f"[Image content: {extracted}]")
+
+                original = msg.get("content", "")
+                msg["content"] = "\n\n".join(extracted_texts) + "\n\n" + original
+                del msg["images"]
 
         return body
 
     def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        # Modify or analyze the response body after processing by the API.
-        # This function is the post-processor for the API, which can be used to modify the response
-        # or perform additional checks and analytics.
-        print(f"outlet:{__name__}")
-        print(f"outlet:body:{body}")
-        print(f"outlet:user:{__user__}")
-
         return body
