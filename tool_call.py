@@ -45,21 +45,28 @@ from shinka.core import run_shinka_eval
 # to match the kernel under test.
 
 EVAL_CONFIGS: List[Dict[str, Any]] = [
-    {"input_size": (1024,), "dtype": "float32", "label": "small_f32"},
-    {"input_size": (1024,), "dtype": "float16", "label": "small_f16"},
-    {"input_size": (65536,), "dtype": "float32", "label": "medium_f32"},
-    {"input_size": (65536,), "dtype": "float16", "label": "medium_f16"},
-    {"input_size": (1048576,), "dtype": "float32", "label": "large_f32"},
-    {"input_size": (1048576,), "dtype": "float16", "label": "large_f16"},
-    {"input_size": (4194304,), "dtype": "float32", "label": "xlarge_f32"},
+    # input_size is (M, N, K) for matmul: C[M,N] = A[M,K] @ B[K,N]
+    {"input_size": (256, 256, 256), "dtype": "float32", "label": "small_f32"},
+    {"input_size": (256, 256, 256), "dtype": "float16", "label": "small_f16"},
+    {"input_size": (1024, 1024, 1024), "dtype": "float32", "label": "medium_f32"},
+    {"input_size": (1024, 1024, 1024), "dtype": "float16", "label": "medium_f16"},
+    {"input_size": (2048, 2048, 2048), "dtype": "float32", "label": "large_f32"},
+    {"input_size": (2048, 2048, 2048), "dtype": "float16", "label": "large_f16"},
+    {"input_size": (4096, 4096, 4096), "dtype": "float32", "label": "xlarge_f32"},
+    {"input_size": (4096, 4096, 4096), "dtype": "float16", "label": "xlarge_f16"},
+    # Non-square shapes to test robustness
+    {"input_size": (1024, 2048, 512), "dtype": "float32", "label": "nonsquare_f32"},
+    {"input_size": (2048, 512, 4096), "dtype": "float16", "label": "nonsquare_f16"},
 ]
 
 NUM_WARMUP_ITERS = 10
 NUM_BENCHMARK_ITERS = 100
 
-# Per-dtype tolerances for correctness
-ATOL = {"float32": 1e-5, "float16": 1e-2, "bfloat16": 1e-2}
-RTOL = {"float32": 1e-5, "float16": 1e-2, "bfloat16": 1e-2}
+# Per-dtype tolerances for correctness.
+# Matmul accumulates FP error proportional to K, so tolerances are
+# more generous than element-wise operations.
+ATOL = {"float32": 1e-3, "float16": 1e-1, "bfloat16": 1e-1}
+RTOL = {"float32": 1e-3, "float16": 1e-2, "bfloat16": 1e-2}
 
 # Minimum fraction of elements that must be within tolerance to pass
 ELEMENT_WISE_PASS_THRESHOLD = 0.999
