@@ -1,94 +1,197 @@
 # EVOLVE-BLOCK-START
-"""Constructor-based circle packing for n=26 circles"""
+"""Naive Triton matrix multiplication kernel for C = A @ B"""
 
-import numpy as np
+import triton
+import triton.language as tl
 
 
-def construct_packing():
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
     """
-    Construct a specific arrangement of 26 circles in a unit square
-    that attempts to maximize the sum of their radii.
+    Naive tiled matrix multiplication.
 
-    Returns:
-        Tuple of (centers, radii, sum_of_radii)
-        centers: np.array of shape (26, 2) with (x, y) coordinates
-        radii: np.array of shape (26) with radius of each circle
-        sum_of_radii: Sum of all radii
+    Computes C[M, N] = A[M, K] @ B[K, N] using simple block-tiling
+    with no advanced optimizations (no L2 swizzling, no split-K,
+    no software pipelining).  A straightforward baseline for evolution.
     """
-    # Initialize arrays for 26 circles
-    n = 26
-    centers = np.zeros((n, 2))
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    # Place circles in a structured pattern
-    # This is a simple pattern - evolution will improve this
+    # Row / column offsets for this tile
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # First, place a large circle in the center
-    centers[0] = [0.5, 0.5]
+    # Pointers to the first BLOCK_SIZE_K strip of A and B
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-    # Place 8 circles around it in a ring
-    for i in range(8):
-        angle = 2 * np.pi * i / 8
-        centers[i + 1] = [0.5 + 0.3 * np.cos(angle), 0.5 + 0.3 * np.sin(angle)]
+    # Accumulator – always in float32 for numerical stability
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Place 16 more circles in an outer ring
-    for i in range(16):
-        angle = 2 * np.pi * i / 16
-        centers[i + 9] = [0.5 + 0.7 * np.cos(angle), 0.5 + 0.7 * np.sin(angle)]
+    # Loop over K dimension in BLOCK_SIZE_K chunks
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        # Boundary masks
+        a_mask = (offs_m[:, None] < M) & ((k_start + offs_k[None, :]) < K)
+        b_mask = ((k_start + offs_k[:, None]) < K) & (offs_n[None, :] < N)
 
-    # Additional positioning adjustment to make sure all circles
-    # are inside the square and don't overlap
-    # Clip to ensure everything is inside the unit square
-    centers = np.clip(centers, 0.01, 0.99)
+        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_tile = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-    # Compute maximum valid radii for this configuration
-    radii = compute_max_radii(centers)
-    return centers, radii
+        acc += tl.dot(a_tile, b_tile)
+
+        # Advance pointers along K
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Write output tile
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 
-def compute_max_radii(centers):
-    """
-    Compute the maximum possible radii for each circle position
-    such that they don't overlap and stay within the unit square.
+def triton_matmul(a, b):
+    """Launch the naive Triton matmul kernel."""
+    import torch
 
-    Args:
-        centers: np.array of shape (n, 2) with (x, y) coordinates
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Inner dimension mismatch: A is {a.shape}, B is {b.shape}"
 
-    Returns:
-        np.array of shape (n) with radius of each circle
-    """
-    n = centers.shape[0]
-    radii = np.ones(n)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    # First, limit by distance to square borders
-    for i in range(n):
-        x, y = centers[i]
-        # Distance to borders
-        radii[i] = min(x, y, 1 - x, 1 - y)
+    # Fixed, conservative tile sizes – evolution can tune these
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 32
 
-    # Then, limit by distance to other circles
-    # Each pair of circles with centers at distance d can have
-    # sum of radii at most d to avoid overlap
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        triton.cdiv(N, BLOCK_SIZE_N),
+    )
 
-            # If current radii would cause overlap
-            if radii[i] + radii[j] > dist:
-                # Scale both radii proportionally
-                scale = dist / (radii[i] + radii[j])
-                radii[i] *= scale
-                radii[j] *= scale
-
-    return radii
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+    )
+    return c
 
 
 # EVOLVE-BLOCK-END
 
 
-# This part remains fixed (not evolved)
-def run_packing():
-    """Run the circle packing constructor for n=26"""
-    centers, radii = construct_packing()
-    # Calculate the sum of radii
-    sum_radii = np.sum(radii)
-    return centers, radii, sum_radii
+# ── Fixed harness below (not evolved) ──────────────────────────────────────
+
+import time
+import numpy as np
+
+
+def run_triton_kernel(
+    input_size,
+    dtype_str,
+    label,
+    num_warmup,
+    num_benchmark,
+    seed,
+):
+    """
+    Benchmark harness called by eval_triton_kernel.py.
+
+    Args:
+        input_size:    (M, N, K) dimensions for matmul.
+        dtype_str:     One of "float32", "float16", "bfloat16".
+        label:         Human-readable config label.
+        num_warmup:    GPU warmup iterations (results discarded).
+        num_benchmark: Timed iterations for statistics.
+        seed:          RNG seed for reproducibility.
+
+    Returns:
+        Dict with kernel_output, reference_output, timings, and metadata.
+    """
+    import torch
+
+    torch.manual_seed(seed)
+
+    # ---- Parse dimensions ----
+    if len(input_size) == 3:
+        M, N, K = input_size
+    elif len(input_size) == 1:
+        M = N = K = input_size[0]
+    else:
+        M, N = input_size
+        K = M
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[dtype_str]
+
+    # ---- Generate inputs ----
+    a = torch.randn(M, K, device="cuda", dtype=dtype)
+    b = torch.randn(K, N, device="cuda", dtype=dtype)
+
+    # ---- Reference (cuBLAS via PyTorch) ----
+    ref_out = torch.matmul(a, b)
+
+    # ---- Warmup ----
+    for _ in range(num_warmup):
+        triton_matmul(a, b)
+    torch.cuda.synchronize()
+
+    # ---- Benchmark Triton kernel ----
+    torch.cuda.reset_peak_memory_stats()
+    kernel_times = []
+    for _ in range(num_benchmark):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        c = triton_matmul(a, b)
+        torch.cuda.synchronize()
+        kernel_times.append((time.perf_counter() - t0) * 1000.0)
+
+    peak_mem = torch.cuda.max_memory_allocated()
+
+    # ---- Benchmark reference (cuBLAS) ----
+    ref_times = []
+    for _ in range(num_benchmark):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.matmul(a, b)
+        torch.cuda.synchronize()
+        ref_times.append((time.perf_counter() - t0) * 1000.0)
+
+    # ---- Build result dict ----
+    elem_size = a.element_size()
+    bytes_processed = (M * K + K * N + M * N) * elem_size  # read A, B + write C
+    flops = 2 * M * N * K  # multiply-add counted as 2 ops
+
+    return {
+        "kernel_output": c.cpu().numpy(),
+        "reference_output": ref_out.cpu().numpy(),
+        "kernel_time_ms": float(np.median(kernel_times)),
+        "reference_time_ms": float(np.median(ref_times)),
+        "kernel_times_ms": kernel_times,
+        "reference_times_ms": ref_times,
+        "peak_memory_bytes": int(peak_mem),
+        "num_elements": M * N,
+        "bytes_processed": bytes_processed,
+        "flops": flops,
+        "dtype": dtype_str,
+        "label": label,
+    }
