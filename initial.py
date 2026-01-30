@@ -1,197 +1,96 @@
 # EVOLVE-BLOCK-START
-"""Naive Triton matrix multiplication kernel for C = A @ B"""
+"""Triton based matrix multiplication kernel"""
 
+import torch
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def matmul_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """
-    Naive tiled matrix multiplication.
-
-    Computes C[M, N] = A[M, K] @ B[K, N] using simple block-tiling
-    with no advanced optimizations (no L2 swizzling, no split-K,
-    no software pipelining).  A straightforward baseline for evolution.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    # Row / column offsets for this tile
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Pointers to the first BLOCK_SIZE_K strip of A and B
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    # Accumulator – always in float32 for numerical stability
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    # Loop over K dimension in BLOCK_SIZE_K chunks
-    for k_start in range(0, K, BLOCK_SIZE_K):
-        # Boundary masks
-        a_mask = (offs_m[:, None] < M) & ((k_start + offs_k[None, :]) < K)
-        b_mask = ((k_start + offs_k[:, None]) < K) & (offs_n[None, :] < N)
-
-        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b_tile = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-        acc += tl.dot(a_tile, b_tile)
-
-        # Advance pointers along K
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # Write output tile
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=c_mask)
-
-
-def triton_matmul(a, b):
-    """Launch the naive Triton matmul kernel."""
-    import torch
-
-    M, K = a.shape
-    K2, N = b.shape
-    assert K == K2, f"Inner dimension mismatch: A is {a.shape}, B is {b.shape}"
-
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-
-    # Fixed, conservative tile sizes – evolution can tune these
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 32
-
-    grid = (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N),
-    )
-
-    matmul_kernel[grid](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-    )
-    return c
-
-
-# EVOLVE-BLOCK-END
-
-
-# ── Fixed harness below (not evolved) ──────────────────────────────────────
-
 import time
 import numpy as np
 
 
-def run_triton_kernel(
-    input_size,
-    dtype_str,
-    label,
-    num_warmup,
-    num_benchmark,
-    seed,
+@triton.jit
+def matmul_kernel(
+    A, B, C, 
+    M, N, K,  
+    stride_AM, stride_AK, 
+    stride_BK, stride_BN,  
+    stride_CM, stride_CN 
 ):
-    """
-    Benchmark harness called by eval_triton_kernel.py.
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    Args:
-        input_size:    (M, N, K) dimensions for matmul.
-        dtype_str:     One of "float32", "float16", "bfloat16".
-        label:         Human-readable config label.
-        num_warmup:    GPU warmup iterations (results discarded).
-        num_benchmark: Timed iterations for statistics.
-        seed:          RNG seed for reproducibility.
+    acc = 0.0
 
-    Returns:
-        Dict with kernel_output, reference_output, timings, and metadata.
-    """
-    import torch
+    for kk in range(K):
+        a_index = pid_m * stride_AM + kk * stride_AK
+        b_index = kk * stride_BK + pid_n * stride_BN
 
-    torch.manual_seed(seed)
+        a_element = tl.load(A + a_index)
+        b_element = tl.load(B + b_index)
+        acc += a_element * b_element
 
-    # ---- Parse dimensions ----
-    if len(input_size) == 3:
-        M, N, K = input_size
-    elif len(input_size) == 1:
-        M = N = K = input_size[0]
-    else:
-        M, N = input_size
-        K = M
+    c_index = pid_m * stride_CM + pid_n * stride_CN
+    tl.store(C + c_index, acc)
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
+
+
+
+def run_matmul(M, N, K):
+    '''
+    Multiply matrices using triton in most-efficient wat
+    function returns:
+    {
+        "C_triton": torch.Tensor,   # (M, K) output from Triton kernel
+        "A": torch.Tensor,          # (M, N) input matrix
+        "B": torch.Tensor,          # (N, K) input matrix
+        "triton_ms": float,         # median Triton kernel time in ms
+        "torch_ms": float,          # median torch.matmul time in ms
+        "M": int, "N": int, "K": int,
     }
-    dtype = dtype_map[dtype_str]
+    '''
+    A = torch.randn((M, N), device='cuda')
+    B = torch.randn((N, K), device='cuda')
+    C_triton = torch.zeros((M, K), device='cuda')
 
-    # ---- Generate inputs ----
-    a = torch.randn(M, K, device="cuda", dtype=dtype)
-    b = torch.randn(K, N, device="cuda", dtype=dtype)
+    grid = (M, N)
 
-    # ---- Reference (cuBLAS via PyTorch) ----
-    ref_out = torch.matmul(a, b)
-
-    # ---- Warmup ----
-    for _ in range(num_warmup):
-        triton_matmul(a, b)
-    torch.cuda.synchronize()
-
-    # ---- Benchmark Triton kernel ----
-    torch.cuda.reset_peak_memory_stats()
-    kernel_times = []
-    for _ in range(num_benchmark):
+    triton_times = []
+    for _ in range(10):
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        c = triton_matmul(a, b)
-        torch.cuda.synchronize()
-        kernel_times.append((time.perf_counter() - t0) * 1000.0)
+        start_time = time.time()
+        matmul_kernel[grid](
+            A, B, C_triton,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            C_triton.stride(0), C_triton.stride(1)
+        )
+        # EVOLVE-BLOCK-END
 
-    peak_mem = torch.cuda.max_memory_allocated()
-
-    # ---- Benchmark reference (cuBLAS) ----
-    ref_times = []
-    for _ in range(num_benchmark):
+        # This part remains fixed (not evolved)
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        torch.matmul(a, b)
-        torch.cuda.synchronize()
-        ref_times.append((time.perf_counter() - t0) * 1000.0)
+        end_time = time.time()
+        triton_times.append((end_time - start_time) * 1000)
 
-    # ---- Build result dict ----
-    elem_size = a.element_size()
-    bytes_processed = (M * K + K * N + M * N) * elem_size  # read A, B + write C
-    flops = 2 * M * N * K  # multiply-add counted as 2 ops
+    torch_times = []
+    for _ in range(10):
+        torch.cuda.synchronize()
+        start_time = time.time()
+        C_torch = torch.matmul(A, B)
+        torch.cuda.synchronize()
+        end_time = time.time()
+        torch_times.append((end_time - start_time) * 1000)
+
+    triton_ms = np.median(triton_times)
+    torch_ms = np.median(torch_times)
 
     return {
-        "kernel_output": c.cpu().numpy(),
-        "reference_output": ref_out.cpu().numpy(),
-        "kernel_time_ms": float(np.median(kernel_times)),
-        "reference_time_ms": float(np.median(ref_times)),
-        "kernel_times_ms": kernel_times,
-        "reference_times_ms": ref_times,
-        "peak_memory_bytes": int(peak_mem),
-        "num_elements": M * N,
-        "bytes_processed": bytes_processed,
-        "flops": flops,
-        "dtype": dtype_str,
-        "label": label,
+        "C_triton": C_triton,
+        "A": A,
+        "B": B,
+        "triton_ms": triton_ms,
+        "torch_ms": torch_ms,
+        "M": M,
+        "N": N,
+        "K": K,
     }
