@@ -1,24 +1,45 @@
-### Task:
-Respond to the user query using the provided context, incorporating inline citations in the format [id] **only when the <source> tag includes an explicit id attribute** (e.g., <source id="1">).
-
-### Guidelines:
-- If you don't know the answer, clearly state that.
-- If uncertain, ask the user for clarification.
-- Respond in the same language as the user's query.
-- If the context is unreadable or of poor quality, inform the user and provide the best possible answer.
-- If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.
-- **Only include inline citations using [id] (e.g., [1], [2]) when the <source> tag includes an id attribute.**
-- Do not cite if the <source> tag does not contain an id attribute.
-- Do not use XML tags in your response.
-- Ensure citations are concise and directly related to the information provided.
-
-### Example of Citation:
-If the user asks about a specific topic and the information is found in a source with a provided id attribute, the response should include the citation like in the following example:
-* "According to the study, the proposed method increases efficiency by 20% [1]."
-
-### Output:
-Provide a clear and direct response to the user's query, including inline citations in the format [id] only when the <source> tag with id attribute is present in the context.
-
-<context>
-{{CONTEXT}}
-</context>
+================================================================================                    │
+AI KERNEL GENERATOR - 统一进化式算子生成                                                            │
+================================================================================                    │
+算子名称: aikg_relu                                                                                 │
+实现类型: triton_cuda                                                                               │
+框架: torch                                                                                         │
+后端: cuda                                                                                          │
+架构: a100                                                                                          │
+进化轮数: 3                                                                                         │
+并行任务数: 4                                                                                       │
+岛屿数量: 2                                                                                         │
+迁移间隔: 2                                                                                         │
+精英数量: 5                                                                                         │
+父代选择概率: 0.5                                                                                   │
+================================================================================                    │
+🔍 正在检查环境...                                                                                  │
+🔍 从配置字典读取到模型: vllm_my_local_glm_default                                                  │
+🔍 检查模型: vllm_my_local_glm_default                                                              │
+  使用环境变量AIKG_VLLM_API_BASE: http://localhost:30001/v1                                         │
+                                                                                                    │
+ℹ️  本地服务，无需API密钥                                                                           │
+⚠️  API连接测试失败，请检查 http://localhost:30001 是否可访问                                       │
+🚨 发现问题:                                                                                        │
+  ❌ LLM API配置或连接有问题                                                                         │
+                                                                                                    │
+请解决上述问题后重试。                                                                              │
+Traceback (most recent call last):                                                                  │
+  File "/home/dvlkrapivin/akg/aikg/examples/run_torch_evolve_triton.py", line 135, in <module>      │
+    asyncio.run(run_torch_evolve_triton())                                                          │
+  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run                                   │
+    return runner.run(main)                                                                         │
+           ^^^^^^^^^^^^^^^^                                                                         │
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run                                   │
+    return self._loop.run_until_complete(task)                                                      │
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                                      │
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete                │
+    return future.result()                                                                          │
+           ^^^^^^^^^^^^^^^                                                                          │
+  File "/home/dvlkrapivin/akg/aikg/examples/run_torch_evolve_triton.py", line 108, in run_torch_evol│
+ve_triton                                                                                           │
+    check_env_for_task(config.framework, config.backend, config.dsl, loaded_config)                 │
+  File "/home/dvlkrapivin/akg/aikg/python/ai_kernel_generator/utils/environment_check.py", line 412,│
+ in check_env_for_task                                                                              │
+    raise RuntimeError("环境检查失败，请解决上述问题后重试")                                        │
+RuntimeError: 环境检查失败，请解决上述问题后重试
